@@ -1,0 +1,12 @@
+# point_world
+
+Learning project: winit + vulkano (via Vulkano).
+
+Status:
+- winit window created
+- event loop via ApplicationHandler
+
+Next:
+- create surface + swapchain
+- clear to black
+- point pipeline for globe
