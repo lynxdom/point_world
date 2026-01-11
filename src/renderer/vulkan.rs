@@ -17,6 +17,7 @@ use vulkano::command_buffer::{
         RenderPassBeginInfo, 
         SubpassContents,
         SubpassEndInfo,
+        SubpassBeginInfo,
     };
 
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
@@ -56,76 +57,62 @@ impl Renderer {
     // expose *intent*, not guts
     pub fn request_redraw(&self) { }
 
-    pub fn render(&mut self) {
+    pub fn render(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let inst = &mut self.inst;
-        let rcx = inst.rcx.as_ref().expect("RenderContext not initialized");
+        let rcx = inst.rcx.as_ref().unwrap();
 
-        // 1) Clean up GPU work from previous frames
-        if let Some(fut) = inst.previous_frame_end.as_mut() {
-            fut.cleanup_finished();
-        }
+        inst.previous_frame_end
+            .as_mut()
+            .unwrap()
+            .cleanup_finished();
 
-        // 2) Acquire the next swapchain image to render into
-        let (image_index, _suboptimal, acquire_future) =
-            match swapchain::acquire_next_image(rcx.swapchain.clone(), None) {
-                Ok(r) => r,
-                Err(AcquireError::OutOfDate) => {
-                    // window resized / swapchain invalid; recreate later
-                    return;
-                }
-                Err(e) => panic!("Failed to acquire next image: {e:?}"),
-            };
+        let (image_index, suboptimal, acquire_future) =
+            vulkano::swapchain::acquire_next_image(rcx.swapchain.clone(), None)?;
 
-        // 3) Record command buffer: begin render pass with a clear color, then end.
-        let framebuffer = rcx.frame_buffers[image_index as usize].clone();
+        let clear_values = vec![Some(ClearValue::Float([0.05, 0.05, 0.1, 1.0]))];
 
         let mut builder = AutoCommandBufferBuilder::primary(
-            &inst.command_buffer_allocator,
+            inst.command_buffer_allocator.clone(),
             inst.queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
+        )?;
 
-        builder
-            .begin_render_pass(
-                RenderPassBeginInfo {
-                    clear_values: vec![Some(ClearValue::Float([0.1, 0.1, 0.2, 1.0]))], // bluish
-                    ..RenderPassBeginInfo::framebuffer(framebuffer)
-                },
-                SubpassContents::Inline,
-            )
-            .unwrap();
+        let fb = rcx.frame_buffers[image_index as usize].clone();
 
-        // (Later: bind pipeline + draw here)
+        let begin_info = RenderPassBeginInfo {
+            clear_values: vec![
+                Some(ClearValue::Float([0.8, 0.8, 0.8, 1.0]))
+            ],
+            ..RenderPassBeginInfo::framebuffer(fb)
+        };
 
-        builder.end_render_pass().unwrap();
+        builder.begin_render_pass(
+            begin_info,
+            SubpassBeginInfo {
+                contents: SubpassContents::Inline,
+                ..Default::default()
+            },
+        )?;
 
-        let command_buffer = builder.build().unwrap();
+        builder.end_render_pass(SubpassEndInfo::default())?;
 
-        // 4) Submit + present, chaining futures correctly
-        let previous = inst.previous_frame_end.take().unwrap();
+        let command_buffer = builder.build()?;
 
-        let future = previous
+        let future = inst.previous_frame_end.take().unwrap()
             .join(acquire_future)
-            .then_execute(inst.queue.clone(), command_buffer)
-            .unwrap()
+            .then_execute(inst.queue.clone(), command_buffer)?   // <-- HERE
             .then_swapchain_present(
                 inst.queue.clone(),
                 SwapchainPresentInfo::swapchain_image_index(rcx.swapchain.clone(), image_index),
             )
-            .then_signal_fence_and_flush();
+            .then_signal_fence_and_flush()?;
 
-        inst.previous_frame_end = Some(match future {
-            Ok(f) => f.boxed(),
-            Err(sync::FlushError::OutOfDate) => {
-                // swapchain became invalid during present; recreate later
-                sync::now(inst.device.clone()).boxed()
-            }
-            Err(e) => {
-                eprintln!("Flush error: {e:?}");
-                sync::now(inst.device.clone()).boxed()
-            }
-        });
+        inst.previous_frame_end = Some(future.boxed());
+
+        // you’ll handle swapchain recreation here later using `suboptimal`
+        let _ = suboptimal;
+
+        Ok(())
     }
 }
 
@@ -134,7 +121,7 @@ struct RenderInstance {
     surface: Arc<Surface>,
     device: Arc<Device>,
     queue: Arc<Queue>,
-    command_buffer_allocator: StandardCommandBufferAllocator,
+    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
     rcx: Option<RenderContext>,
 }
@@ -323,7 +310,10 @@ impl RenderInstance {
             ));
         
         let command_buffer_allocator =
-            StandardCommandBufferAllocator::new(device.clone(), Default::default());
+            Arc::new(StandardCommandBufferAllocator::new(
+                device.clone(), 
+                Default::default() )
+            );
 
         // This future represents “nothing has been submitted yet”, and it’s the standard starting point.
         let previous_frame_end = Some(vulkano::sync::now(device.clone()).boxed());
